@@ -1,0 +1,29 @@
+# buf.gen.yaml — правила кодогенерации из .proto файлов.
+#
+# Этот файл говорит buf: "возьми .proto, сгенерируй Go-код сюда"
+version: v2
+
+# Каждый plugin генерирует свой тип кода
+plugins:
+  # protoc-gen-go — генерирует Go-структуры из protobuf messages.
+  # Результат: типы TelemetryRecord, TelemetryBatch и т.д.
+  # с методами сериализации/десериализации
+  - local: protoc-gen-go
+    out: internal/transport/grpc/pb
+    opt:
+      - paths=source_relative
+
+  # protoc-gen-go-grpc — генерирует Go-интерфейсы и клиент/сервер для gRPC services.
+  # Результат: TelemetryServiceServer (интерфейс для реализации),
+  #            TelemetryServiceClient (клиент для вызова)
+  #
+  # ПОЧЕМУ два отдельных плагина?
+  # Разделение ответственности:
+  # - protoc-gen-go: только структуры данных (можно использовать без gRPC)
+  # - protoc-gen-go-grpc: только сетевой слой
+  # Это позволяет использовать protobuf для сериализации в WAL или NATS
+  # БЕЗ зависимости от gRPC
+  - local: protoc-gen-go-grpc
+    out: internal/transport/grpc/pb
+    opt:
+      - paths=source_relative
