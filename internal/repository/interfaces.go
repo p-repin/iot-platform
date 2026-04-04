@@ -39,4 +39,8 @@ type TelemetryRepository interface {
 	// InsertBatch записывает пакет записей в хранилище.
 	// Реализация должна быть идемпотентной: ON CONFLICT (record_id, time) DO UPDATE.
 	InsertBatch(ctx context.Context, records []entity.Record) error
+
+	// Close освобождает ресурсы (закрывает пул соединений).
+	// Вызывается при graceful shutdown сервера.
+	Close()
 }

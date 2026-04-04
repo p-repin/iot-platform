@@ -101,7 +101,7 @@ func Load() *Config {
 	return &Config{
 		DB: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
-			Port:     getEnvInt("DB_PORT", 5432),
+			Port:     getEnvInt("DB_PORT", 5433),
 			User:     getEnv("DB_USER", "pzmash"),
 			Password: getEnv("DB_PASSWORD", "pzmash_secret"),
 			DBName:   getEnv("DB_NAME", "pzmash_iot"),

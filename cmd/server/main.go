@@ -1,82 +1,132 @@
 // cmd/server/main.go — точка входа серверного приложения.
 //
-// СТРУКТУРА ПРОЕКТА (стандарт Go):
-// cmd/    — точки входа (main.go для каждого бинарника)
-// internal/ — внутренний код (НЕ импортируется другими модулями)
-// proto/  — .proto схемы
+// COMPOSITION ROOT — единственное место, где собираются все зависимости.
+// Здесь мы "склеиваем" слои чистой архитектуры:
+//   pgxpool → PostgresRepo → DBService → gRPC Server
 //
-// ПОЧЕМУ cmd/server/ а не просто main.go в корне?
-// У нас НЕСКОЛЬКО бинарников: server, agent, dashboard.
-// Каждый живёт в своей директории под cmd/.
-// go build ./cmd/server → бинарник server
-// go build ./cmd/agent  → бинарник agent
-//
-// ПОЧЕМУ internal/?
-// Go запрещает импорт пакетов из internal/ извне модуля.
-// Это ГАРАНТИЯ на уровне компилятора что внутренний код не утечёт наружу.
-// Без internal/ любой может сделать import "github.com/pzmash/.../telemetry"
-// и завязаться на наши внутренние структуры.
+// ПОЧЕМУ зависимости собираются в main, а не в каждом пакете?
+// 1. Каждый пакет зависит от ИНТЕРФЕЙСОВ, а не от конкретных реализаций
+// 2. main.go решает КАКУЮ реализацию подставить (PostgreSQL vs мок)
+// 3. Все зависимости видны в одном месте — легко понять архитектуру
+// 4. На собеседовании: "Как вы реализуете Dependency Injection в Go?"
+//    Ответ: через конструкторы в Composition Root (main.go), без фреймворков.
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/pzmash/iot-platform/internal/config"
+	"github.com/pzmash/iot-platform/internal/repository"
 	"github.com/pzmash/iot-platform/internal/service"
 	grpcTransport "github.com/pzmash/iot-platform/internal/transport/grpc"
 	pb "github.com/pzmash/iot-platform/internal/transport/grpc/pb"
 )
 
 func main() {
+	// === 1. Structured logging (slog) ===
+	// ПОЧЕМУ slog, а не zerolog/zap?
+	// slog — стандартная библиотека Go (с 1.21). Не нужна внешняя зависимость.
+	// zerolog/zap быстрее на ~20-30%, но для нашей нагрузки (20 станков) разницы нет.
+	// На собеседовании: "Мы используем slog из stdlib, при необходимости можно
+	// заменить handler на zerolog/zap без изменения вызывающего кода."
+	//
+	// ПОЧЕМУ JSON, а не Text?
+	// DevOps-требование: JSON-логи парсятся автоматически.
+	// Promtail/Loki/Elasticsearch читают JSON без кастомных regex-парсеров.
+	// TextHandler удобнее для локальной разработки, но в проде — только JSON.
+	//
+	// УРОВЕНЬ LevelDebug:
+	// В проде обычно LevelInfo (меньше шума). В dev — LevelDebug для отладки.
+	// Можно вынести в конфиг: LOG_LEVEL=debug|info|warn|error.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	slog.SetDefault(logger)
+
 	// Загружаем конфигурацию из переменных окружения
 	cfg := config.Load()
 
-	// Создаём gRPC сервер.
-	// ПОЧЕМУ без TLS?
-	// В dev-окружении TLS избыточен (localhost → localhost).
-	// В проде (air-gap контур) сеть физически изолирована,
-	// но можно добавить mTLS для defense-in-depth.
-	grpcServer := grpc.NewServer()
+	// === 2. Graceful shutdown ===
+	// signal.NotifyContext — создаёт контекст, отменяемый по SIGINT/SIGTERM.
+	// При docker stop контейнер получает SIGTERM → контекст отменяется →
+	// закрываем соединения и завершаемся корректно.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// Создаём сервис телеметрии (пока LogService, в Фазе 3 заменим на DBService).
-	// CLEAN ARCHITECTURE: main.go — единственное место, где собираются зависимости.
-	// Это называется Composition Root: здесь мы "склеиваем" слои вместе.
-	svc := &service.LogService{}
+	// === 3. Подключение к TimescaleDB ===
+	// ПОРЯДОК ИНИЦИАЛИЗАЦИИ: БД первая, потому что без неё сервер бесполезен.
+	// Если БД недоступна — падаем сразу (fail fast), а не через минуту
+	// когда придёт первый запрос от агента.
+	slog.Info("Подключение к TimescaleDB...", "host", cfg.DB.Host, "db", cfg.DB.DBName)
 
-	// Регистрируем наш сервис в gRPC сервере.
-	// pb.RegisterTelemetryServiceServer — сгенерированная функция из .proto.
-	// Она связывает наш Server с gRPC фреймворком.
+	repo, err := repository.NewPostgresRepo(ctx, cfg.DB.DSN())
+	if err != nil {
+		slog.Error("Не удалось подключиться к TimescaleDB", "error", err)
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	// === 4. Собираем зависимости (Composition Root) ===
+	// Цепочка: PostgresRepo → DBService → gRPC Server
+	// Каждый слой получает зависимости через конструктор (DI без фреймворков).
+	svc := service.NewDBService(repo)
 	telemetryServer := grpcTransport.NewServer(svc)
+
+	// === 5. gRPC сервер ===
+	grpcServer := grpc.NewServer()
 	pb.RegisterTelemetryServiceServer(grpcServer, telemetryServer)
 
-	// gRPC Reflection — позволяет инструментам (grpcurl, Postman)
-	// узнать какие сервисы и методы доступны БЕЗ .proto файла.
-	// ПОЧЕМУ включаем?
-	// - В dev: удобно тестировать через grpcurl (аналог curl для gRPC)
-	// - В проде: можно отключить из соображений безопасности
-	//   (скрыть структуру API от потенциального злоумышленника)
+	// gRPC Reflection — инструменты (grpcurl, Postman) могут узнать
+	// список сервисов и методов БЕЗ .proto файла.
 	reflection.Register(grpcServer)
 
-	// Открываем TCP listener
 	addr := fmt.Sprintf(":%d", cfg.Server.GRPCPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("Не удалось открыть порт %s: %v", addr, err)
+		slog.Error("Не удалось открыть порт", "addr", addr, "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("gRPC сервер запущен на %s", addr)
+	slog.Info("gRPC сервер запущен", "addr", addr)
 
-	// Serve блокирует выполнение — сервер обрабатывает запросы до остановки.
-	// ПОЧЕМУ log.Fatalf, а не return err?
-	// В main() некому возвращать ошибку — это верхний уровень.
-	// Fatalf логирует и вызывает os.Exit(1) — процесс завершается с ненулевым кодом,
-	// что сигнализирует системе мониторинга о проблеме.
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("gRPC сервер упал: %v", err)
+	// === 6. Запуск с graceful shutdown ===
+	// Запускаем gRPC сервер в отдельной горутине, чтобы main мог
+	// ждать сигнал завершения в select.
+	//
+	// ПОЧЕМУ горутина, а не просто Serve?
+	// grpcServer.Serve() блокирует. Если вызвать его в main —
+	// мы не сможем обработать SIGTERM (контекст отменится, но никто не вызовет
+	// GracefulStop). Горутина позволяет параллельно слушать ctx.Done().
+	errCh := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			errCh <- err
+		}
+	}()
+
+	// Ждём ЛИБО сигнал завершения, ЛИБО ошибку сервера.
+	select {
+	case <-ctx.Done():
+		// Получили SIGINT/SIGTERM → корректно завершаемся.
+		// GracefulStop:
+		// 1. Перестаёт принимать НОВЫЕ соединения
+		// 2. Ждёт завершения ТЕКУЩИХ запросов
+		// 3. Закрывает listener
+		// Это гарантирует что ни один запрос не оборвётся на середине.
+		slog.Info("Получен сигнал завершения, останавливаю gRPC сервер...")
+		grpcServer.GracefulStop()
+		slog.Info("Сервер остановлен корректно")
+	case err := <-errCh:
+		slog.Error("gRPC сервер упал", "error", err)
+		os.Exit(1)
 	}
 }

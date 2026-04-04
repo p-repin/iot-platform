@@ -23,7 +23,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 
 	"github.com/pzmash/iot-platform/internal/entity"
 	"github.com/pzmash/iot-platform/internal/service"
@@ -65,8 +65,10 @@ func NewServer(svc service.TelemetryService) *Server {
 // Это основной метод для отправки данных из WAL — когда агент
 // накопил записи за время offline и отправляет их пачкой.
 func (s *Server) Ingest(ctx context.Context, batch *pb.TelemetryBatch) (*pb.IngestResponse, error) {
-	log.Printf("[gRPC] Ingest: получен батч от агента %s, записей: %d",
-		batch.AgentId, len(batch.Records))
+	slog.Debug("Получен батч",
+		"agent_id", batch.AgentId,
+		"records", len(batch.Records),
+	)
 
 	// Валидация — на границе системы ВСЕГДА проверяем входные данные.
 	// Транспортный слой отвечает за валидацию формата (есть ли записи?).
@@ -84,7 +86,10 @@ func (s *Server) Ingest(ctx context.Context, batch *pb.TelemetryBatch) (*pb.Inge
 		return nil, fmt.Errorf("ошибка обработки батча: %w", err)
 	}
 
-	log.Printf("[gRPC] Ingest: принято %d записей, ошибок: %d", accepted, len(recordErrors))
+	slog.Info("Батч обработан",
+		"accepted", accepted,
+		"errors", len(recordErrors),
+	)
 
 	return &pb.IngestResponse{
 		AcceptedCount: int32(accepted),
@@ -136,7 +141,9 @@ func (s *Server) StreamTelemetry(stream pb.TelemetryService_StreamTelemetryServe
 		totalAccepted += int32(accepted)
 	}
 
-	log.Printf("[gRPC] StreamTelemetry: поток завершён, всего принято: %d", totalAccepted)
+	slog.Info("Поток завершён",
+		"total_accepted", totalAccepted,
+	)
 
 	return stream.SendAndClose(&pb.IngestResponse{
 		AcceptedCount: totalAccepted,
