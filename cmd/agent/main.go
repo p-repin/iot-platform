@@ -1,7 +1,24 @@
 // cmd/agent/main.go — агент сбора телеметрии (точка входа).
 //
-// Пока это УПРОЩЁННАЯ версия: генерирует фейковые данные и отправляет по gRPC.
-// В следующих фазах добавим: WAL, backpressure, sync.Pool, ONNX инференс.
+// ФАЗА 2: Добавлены WAL, backpressure и sync.Pool.
+//
+// АРХИТЕКТУРА АГЕНТА:
+// ┌─────────────┐     ┌─────────┐     ┌──────────────┐     ┌──────────┐
+// │ collectLoop │ ──→ │   WAL   │ ──→ │   sendLoop   │ ──→ │  gRPC    │
+// │ (тикер 1с)  │     │ (диск)  │     │ (backoff)    │     │  сервер  │
+// └─────────────┘     └─────────┘     └──────────────┘     └──────────┘
+//
+// 1. collectLoop: каждую секунду генерирует данные → пишет в WAL
+// 2. WAL: хранит данные на диске (надёжность)
+// 3. sendLoop: читает из WAL → отправляет на сервер (с backoff при ошибках)
+// 4. При подтверждении — WAL очищается
+//
+// GRACEFUL SHUTDOWN:
+// При Ctrl+C (SIGINT) или SIGTERM:
+// 1. Отменяется контекст → collectLoop и sendLoop завершаются
+// 2. WaitGroup ждёт завершения обеих горутин
+// 3. Закрываем WAL и gRPC соединение
+// 4. Данные в WAL НЕ теряются — при следующем запуске будут отправлены
 //
 // ПОЧЕМУ фейковые данные, а не реальный OPC UA?
 // 1. OPC UA сервер — это промышленное оборудование, которого у нас нет
@@ -17,6 +34,8 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,74 +44,106 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/pzmash/iot-platform/internal/config"
+	"github.com/pzmash/iot-platform/internal/telemetry"
 	pb "github.com/pzmash/iot-platform/internal/transport/grpc/pb"
+	"github.com/pzmash/iot-platform/internal/wal"
 )
 
 func main() {
 	cfg := config.Load()
 
-	// Подключаемся к gRPC серверу.
-	// insecure.NewCredentials() — без TLS (для dev-окружения).
-	// grpc.WithBlock() — ждём установления соединения перед продолжением.
-	//
-	// ПОЧЕМУ WithBlock()?
-	// Без него Dial вернётся СРАЗУ, даже если сервер недоступен.
-	// Ошибка вылезет только при первом вызове RPC — сложнее отлаживать.
-	// С WithBlock() мы СРАЗУ узнаём что сервер недоступен.
+	// === 1. Открываем WAL ===
+	// WAL создаётся ДО подключения к серверу.
+	// ПОЧЕМУ? Даже если сервер недоступен — агент должен уметь
+	// собирать и сохранять данные на диск.
+	w, err := wal.Open(cfg.Agent.WALDir)
+	if err != nil {
+		log.Fatalf("Не удалось открыть WAL: %v", err)
+	}
+	defer w.Close()
+
+	log.Printf("WAL открыт: %s", cfg.Agent.WALDir)
+
+	// Проверяем есть ли данные с прошлого запуска
+	if size, err := w.Size(); err == nil && size > 0 {
+		log.Printf("WAL содержит %d байт данных с предыдущего запуска — будут отправлены", size)
+	}
+
+	// === 2. Подключаемся к gRPC серверу ===
 	addr := fmt.Sprintf("localhost:%d", cfg.Server.GRPCPort)
-	// grpc.NewClient создаёт клиент с ЛЕНИВЫМ подключением.
-	// Реальное TCP-соединение устанавливается при первом RPC вызове.
-	// ПОЧЕМУ не ждём подключения здесь?
-	// - gRPC сам умеет переподключаться (reconnect backoff)
-	// - Если сервер недоступен — первый вызов Ingest вернёт ошибку,
-	//   и мы залогируем её (а позже запишем в WAL)
-	// - Это проще и надёжнее чем ручной WaitForStateChange
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
 		log.Fatalf("Не удалось создать gRPC клиент для %s: %v", addr, err)
 	}
-	// defer conn.Close() — ОБЯЗАТЕЛЬНО закрываем соединение при выходе.
-	// Если не закрыть — утечка TCP-соединений (goroutine leak + file descriptor leak).
 	defer conn.Close()
 
-	// Создаём gRPC клиент из сгенерированного кода
 	client := pb.NewTelemetryServiceClient(conn)
 
 	log.Printf("Агент подключен к серверу %s", addr)
 	log.Printf("Станки: %v", cfg.Agent.MachineIDs)
 	log.Printf("Интервал сбора: %v", cfg.Agent.CollectInterval)
 
-	// Основной цикл сбора телеметрии
-	// ticker — более точный чем time.Sleep для периодических задач.
-	// ПОЧЕМУ ticker, а не sleep?
-	// Sleep(1s) + обработка(50ms) = реальный интервал 1.05с (drift накапливается)
-	// Ticker(1s) срабатывает РОВНО каждую секунду независимо от времени обработки
-	ticker := time.NewTicker(cfg.Agent.CollectInterval)
-	defer ticker.Stop()
+	// === 3. Создаём Collector ===
+	// Collector объединяет WAL + gRPC отправку + backpressure + sync.Pool.
+	// Передаём функцию генерации данных — Collector не знает откуда данные,
+	// он знает только как их сохранить и отправить.
+	sender := &grpcSender{client: client}
+	collector := telemetry.NewCollector(
+		w,
+		sender,
+		"agent-01",
+		cfg.Agent.MachineIDs,
+		cfg.Agent.CollectInterval,
+		collectTelemetry,
+	)
 
-	log.Println("Начинаю сбор телеметрии...")
+	// === 4. Graceful shutdown ===
+	// signal.NotifyContext — создаёт контекст, который отменяется при получении
+	// сигнала ОС (SIGINT = Ctrl+C, SIGTERM = docker stop / kill).
+	//
+	// ПОЧЕМУ NotifyContext, а не signal.Notify + канал?
+	// NotifyContext (Go 1.16+) делает то же самое, но:
+	// - Возвращает ctx, который можно передать в горутины
+	// - defer stop() автоматически отписывается от сигналов
+	// - Меньше бойлерплейта
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	for range ticker.C {
-		// Собираем данные со всех станков
-		batch := collectTelemetry(cfg.Agent.MachineIDs)
+	log.Println("Начинаю сбор телеметрии (Ctrl+C для остановки)...")
 
-		// Отправляем батч на сервер
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		resp, err := client.Ingest(ctx, batch)
-		cancel() // ВСЕГДА вызываем cancel() чтобы освободить ресурсы контекста
+	// Run БЛОКИРУЕТ до отмены контекста.
+	// Внутри запускаются collectLoop и sendLoop.
+	// При отмене ctx обе горутины завершаются, Run возвращается.
+	collector.Run(ctx)
 
-		if err != nil {
-			// Пока просто логируем ошибку. В следующей фазе:
-			// - Запишем в WAL (данные не потеряются)
-			// - Circuit breaker остановит попытки если сервер лежит
-			log.Printf("[ОШИБКА] Не удалось отправить данные: %v", err)
-			continue
-		}
+	log.Println("Агент остановлен. Данные в WAL сохранены.")
+}
 
-		log.Printf("Отправлено: %d записей, принято: %d", len(batch.Records), resp.AcceptedCount)
+// grpcSender — адаптер gRPC клиента под интерфейс telemetry.Sender.
+//
+// ПАТТЕРН АДАПТЕР:
+// telemetry.Sender ожидает метод SendBatch(ctx, batch) error.
+// gRPC клиент имеет метод Ingest(ctx, batch) (*Response, error).
+// grpcSender "адаптирует" один интерфейс к другому.
+//
+// ПОЧЕМУ не использовать gRPC клиент напрямую?
+// Collector не должен знать про gRPC — он работает через абстракцию Sender.
+// Завтра захотим отправлять через NATS — напишем natsSender, Collector не меняется.
+type grpcSender struct {
+	client pb.TelemetryServiceClient
+}
+
+func (s *grpcSender) SendBatch(ctx context.Context, batch *pb.TelemetryBatch) error {
+	resp, err := s.client.Ingest(ctx, batch)
+	if err != nil {
+		return err
 	}
+
+	log.Printf("[Sender] Отправлено: %d записей, принято: %d",
+		len(batch.Records), resp.AcceptedCount)
+	return nil
 }
 
 // collectTelemetry генерирует фейковые данные телеметрии.
@@ -110,7 +161,7 @@ func collectTelemetry(machineIDs []string) *pb.TelemetryBatch {
 
 	for _, machineID := range machineIDs {
 		// Генерируем UUID для идемпотентности.
-		// В реальности: агент генерирует UUID ДО записи в WAL.
+		// UUID генерируется ДО записи в WAL.
 		// Если отправка провалилась и мы шлём повторно из WAL —
 		// сервер видит тот же UUID и делает upsert вместо дубликата.
 		record := &pb.TelemetryRecord{
@@ -128,7 +179,6 @@ func collectTelemetry(machineIDs []string) *pb.TelemetryBatch {
 
 	return &pb.TelemetryBatch{
 		Records: records,
-		AgentId: "agent-01",
 	}
 }
 
@@ -139,9 +189,6 @@ func collectTelemetry(machineIDs []string) *pb.TelemetryBatch {
 // - Большинство показаний близки к среднему (mean)
 // - Отклонения уменьшаются по мере удаления от среднего
 // - Равномерное распределение нереалистично: температура 75°C так же вероятна как 120°C
-//
-// anomalyThreshold — порог для аномалии. С вероятностью 5% генерируем
-// значение ВЫШЕ порога — это имитация реального дефекта оборудования.
 func generateValue(mean, stddev, anomalyThreshold float64) float64 {
 	// 5% шанс аномалии
 	if rand.Float64() < 0.05 {
@@ -150,10 +197,6 @@ func generateValue(mean, stddev, anomalyThreshold float64) float64 {
 	}
 
 	// Нормальное значение: Box-Muller transform
-	// ПОЧЕМУ Box-Muller, а не rand.NormFloat64()?
-	// rand.NormFloat64() появился в Go 1.20+ и тоже подходит.
-	// Box-Muller показан для понимания — так генерируют нормальное
-	// распределение из равномерного. На собеседовании полезно знать.
 	u1 := rand.Float64()
 	u2 := rand.Float64()
 	normal := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
