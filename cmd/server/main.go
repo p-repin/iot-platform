@@ -27,7 +27,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/pzmash/iot-platform/internal/config"
-	"github.com/pzmash/iot-platform/internal/telemetry"
+	"github.com/pzmash/iot-platform/internal/service"
 	grpcTransport "github.com/pzmash/iot-platform/internal/transport/grpc"
 	pb "github.com/pzmash/iot-platform/internal/transport/grpc/pb"
 )
@@ -43,13 +43,15 @@ func main() {
 	// но можно добавить mTLS для defense-in-depth.
 	grpcServer := grpc.NewServer()
 
-	// Создаём обработчик телеметрии (пока LogHandler, потом заменим на реальный)
-	handler := &telemetry.LogHandler{}
+	// Создаём сервис телеметрии (пока LogService, в Фазе 3 заменим на DBService).
+	// CLEAN ARCHITECTURE: main.go — единственное место, где собираются зависимости.
+	// Это называется Composition Root: здесь мы "склеиваем" слои вместе.
+	svc := &service.LogService{}
 
 	// Регистрируем наш сервис в gRPC сервере.
 	// pb.RegisterTelemetryServiceServer — сгенерированная функция из .proto.
 	// Она связывает наш Server с gRPC фреймворком.
-	telemetryServer := grpcTransport.NewServer(handler)
+	telemetryServer := grpcTransport.NewServer(svc)
 	pb.RegisterTelemetryServiceServer(grpcServer, telemetryServer)
 
 	// gRPC Reflection — позволяет инструментам (grpcurl, Postman)

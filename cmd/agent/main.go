@@ -43,8 +43,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/pzmash/iot-platform/internal/agent"
 	"github.com/pzmash/iot-platform/internal/config"
-	"github.com/pzmash/iot-platform/internal/telemetry"
 	pb "github.com/pzmash/iot-platform/internal/transport/grpc/pb"
 	"github.com/pzmash/iot-platform/internal/wal"
 )
@@ -90,7 +90,7 @@ func main() {
 	// Передаём функцию генерации данных — Collector не знает откуда данные,
 	// он знает только как их сохранить и отправить.
 	sender := &grpcSender{client: client}
-	collector := telemetry.NewCollector(
+	collector := agent.NewCollector(
 		w,
 		sender,
 		"agent-01",
