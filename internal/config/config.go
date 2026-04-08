@@ -23,12 +23,28 @@ import (
 // Config — корневая структура конфигурации всего приложения.
 // Каждый вложенный struct = один инфраструктурный компонент.
 type Config struct {
-	DB        DatabaseConfig
-	Redis     RedisConfig
-	NATS      NATSConfig
-	Agent     AgentConfig
-	Server    ServerConfig
-	Inference InferenceConfig
+	DB            DatabaseConfig
+	Redis         RedisConfig
+	NATS          NATSConfig
+	Agent         AgentConfig
+	Server        ServerConfig
+	Inference     InferenceConfig
+	PartSimulator PartSimulatorConfig
+}
+
+// PartSimulatorConfig — настройки симулятора жизненного цикла деталей.
+//
+// Симулятор генерирует синтетические события Event Sourcing:
+// PartCreated → PartMachined → InferenceCompleted → PartShipped.
+// Полезен для демонстрации и отладки Event Sourcing.
+// В проде выключается: PART_SIMULATOR_ENABLED=false.
+type PartSimulatorConfig struct {
+	// Enabled — запускать ли симулятор.
+	// По умолчанию true для dev-окружения.
+	Enabled bool
+	// Interval — интервал между генерацией деталей.
+	// 10 секунд — достаточно для наблюдения в логах.
+	Interval time.Duration
 }
 
 // DatabaseConfig — подключение к TimescaleDB.
@@ -155,6 +171,10 @@ func Load() *Config {
 			WindowSize:    getEnvInt("INFERENCE_WINDOW_SIZE", 10),
 			Threshold:     getEnvFloat("INFERENCE_THRESHOLD", 0.7),
 		},
+		PartSimulator: PartSimulatorConfig{
+			Enabled:  getEnvBool("PART_SIMULATOR_ENABLED", true),
+			Interval: getEnvDuration("PART_SIMULATOR_INTERVAL", 10*time.Second),
+		},
 	}
 }
 
@@ -196,6 +216,18 @@ func getEnvFloat(key string, defaultVal float64) float64 {
 		return defaultVal
 	}
 	return f
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	b, err := strconv.ParseBool(val)
+	if err != nil {
+		return defaultVal
+	}
+	return b
 }
 
 func getEnvDuration(key string, defaultVal time.Duration) time.Duration {

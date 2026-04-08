@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/pzmash/iot-platform/internal/config"
+	"github.com/pzmash/iot-platform/internal/events"
 	"github.com/pzmash/iot-platform/internal/inference"
 	"github.com/pzmash/iot-platform/internal/repository"
 	"github.com/pzmash/iot-platform/internal/service"
@@ -109,13 +110,28 @@ func main() {
 		)
 	}
 
-	// === 5. Event Repository (для записи результатов инференса) ===
-	eventRepo := repository.NewPostgresEventRepo(repo.Pool(), logger)
+	// === 5. Event Store (Фаза 5: Event Sourcing) ===
+	// EventStore заменил EventRepository: поддерживает и запись (Append),
+	// и чтение (LoadEvents) для восстановления состояния агрегатов.
+	// Использует тот же pgxpool — отдельный пул не нужен.
+	eventStore := events.NewPostgresEventStore(repo.Pool(), logger)
+
+	// === 5b. Симулятор жизненного цикла деталей ===
+	// Генерирует синтетические события: PartCreated → PartMachined → PartShipped.
+	// После каждого цикла восстанавливает состояние из БД (Rebuild) — доказывает
+	// что Event Sourcing работает. Выключается в проде: PART_SIMULATOR_ENABLED=false.
+	if cfg.PartSimulator.Enabled {
+		simulator := events.NewPartSimulator(eventStore, cfg.PartSimulator.Interval, logger)
+		go simulator.Run(ctx)
+		slog.Info("Симулятор деталей включён",
+			"interval", cfg.PartSimulator.Interval,
+		)
+	}
 
 	// === 6. Собираем зависимости (Composition Root) ===
-	// Цепочка: PostgresRepo → DBService (+ inference + events) → gRPC Server
+	// Цепочка: PostgresRepo → DBService (+ inference + eventStore) → gRPC Server
 	// Каждый слой получает зависимости через конструктор (DI без фреймворков).
-	svc := service.NewDBService(repo, inferSvc, eventRepo)
+	svc := service.NewDBService(repo, inferSvc, eventStore)
 	telemetryServer := grpcTransport.NewServer(svc)
 
 	// === 7. gRPC сервер ===

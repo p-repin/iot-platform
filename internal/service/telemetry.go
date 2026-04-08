@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pzmash/iot-platform/internal/entity"
+	"github.com/pzmash/iot-platform/internal/events"
 	"github.com/pzmash/iot-platform/internal/inference"
 	"github.com/pzmash/iot-platform/internal/repository"
 )
@@ -49,7 +50,7 @@ type TelemetryService interface {
 // 2. Заменить PostgreSQL на другую БД без изменения сервиса
 // 3. Добавить кэширование (декоратор поверх репозитория) прозрачно
 type DBService struct {
-	repo      repository.TelemetryRepository
+	repo repository.TelemetryRepository
 	// inference — ML-сервис для обнаружения аномалий (опционален).
 	// Если nil — сервер работает без ML (graceful degradation).
 	// ПОЧЕМУ опционален?
@@ -57,25 +58,28 @@ type DBService struct {
 	// - Для запуска без обученной модели (первый деплой)
 	// - ML — дополнение к pipeline, а не обязательный шаг
 	inference *inference.Service
-	// eventRepo — репозиторий для записи событий инференса.
-	// Аномалии записываются как InferenceCompleted в Event Sourcing журнал.
-	eventRepo repository.EventRepository
+	// eventStore — хранилище событий Event Sourcing (Фаза 5).
+	// Аномалии записываются как InferenceCompleted в append-only журнал.
+	// ПОЧЕМУ events.EventStore, а не repository.EventRepository?
+	// EventStore — новый интерфейс из пакета events, поддерживающий
+	// и запись (Append), и чтение (LoadEvents) для восстановления состояния.
+	eventStore events.EventStore
 }
 
 // NewDBService создаёт сервис с указанным репозиторием.
 //
 // COMPOSITION ROOT (cmd/server/main.go) создаёт зависимости:
 //   repo := repository.NewPostgresRepo(ctx, dsn)
-//   svc  := service.NewDBService(repo, inferSvc, eventRepo)
+//   svc  := service.NewDBService(repo, inferSvc, eventStore)
 //   srv  := grpc.NewServer(svc)
 //
 // Каждый слой получает свои зависимости через конструктор — это DI (Dependency Injection).
-// inference и eventRepo могут быть nil — сервер работает без ML.
-func NewDBService(repo repository.TelemetryRepository, inferSvc *inference.Service, eventRepo repository.EventRepository) *DBService {
+// inference и eventStore могут быть nil — сервер работает без ML.
+func NewDBService(repo repository.TelemetryRepository, inferSvc *inference.Service, eventStore events.EventStore) *DBService {
 	return &DBService{
-		repo:      repo,
-		inference: inferSvc,
-		eventRepo: eventRepo,
+		repo:       repo,
+		inference:  inferSvc,
+		eventStore: eventStore,
 	}
 }
 
@@ -110,7 +114,7 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 		"records", len(batch.Records),
 	)
 
-	// === ML-инференс (Фаза 4) ===
+	// === ML-инференс (Фаза 4) + Event Sourcing (Фаза 5) ===
 	// Вызываем ПОСЛЕ успешной записи в БД.
 	// ПОЧЕМУ после, а не до?
 	// 1. Данные уже сохранены — даже если ML упадёт, телеметрия не потеряна
@@ -119,21 +123,25 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 	if s.inference != nil {
 		results := s.inference.Analyze(ctx, batch.Records)
 
-		// Записываем аномалии в Event Sourcing журнал
+		// Записываем аномалии в Event Sourcing журнал через EventStore.
+		// ПОЧЕМУ events.DomainEvent вместо repository.Event?
+		// DomainEvent — типизированный: payload = *InferenceCompletedPayload,
+		// а не map[string]any. Это позволяет десериализовать payload
+		// при LoadEvents и использовать в Rebuild агрегата.
 		for _, r := range results {
-			if r.IsAnomaly && s.eventRepo != nil {
-				event := repository.Event{
-					EventType:   "InferenceCompleted",
+			if r.IsAnomaly && s.eventStore != nil {
+				event := events.DomainEvent{
+					EventType:   events.InferenceCompleted,
 					AggregateID: uuid.New().String(),
-					Payload: map[string]any{
-						"machine_id": r.MachineID,
-						"score":      r.Score,
-						"is_anomaly": r.IsAnomaly,
-						"model":      "anomaly_detector_v1",
+					Payload: &events.InferenceCompletedPayload{
+						MachineID: r.MachineID,
+						Score:     r.Score,
+						IsAnomaly: r.IsAnomaly,
+						Model:     "anomaly_detector_v1",
 					},
 					CreatedAt: r.Timestamp,
 				}
-				if err := s.eventRepo.InsertEvent(ctx, event); err != nil {
+				if _, err := s.eventStore.Append(ctx, event); err != nil {
 					slog.Error("Ошибка записи события инференса",
 						"machine_id", r.MachineID,
 						"error", err,
