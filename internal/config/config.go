@@ -23,11 +23,12 @@ import (
 // Config — корневая структура конфигурации всего приложения.
 // Каждый вложенный struct = один инфраструктурный компонент.
 type Config struct {
-	DB     DatabaseConfig
-	Redis  RedisConfig
-	NATS   NATSConfig
-	Agent  AgentConfig
-	Server ServerConfig
+	DB        DatabaseConfig
+	Redis     RedisConfig
+	NATS      NATSConfig
+	Agent     AgentConfig
+	Server    ServerConfig
+	Inference InferenceConfig
 }
 
 // DatabaseConfig — подключение к TimescaleDB.
@@ -89,6 +90,27 @@ type ServerConfig struct {
 	HTTPPort int
 }
 
+// InferenceConfig — настройки ML-инференса.
+//
+// ПОЧЕМУ конфигурируемый threshold?
+// Порог аномалии зависит от условий эксплуатации:
+// - Критичное производство (авиация): threshold=0.5 (лучше ложный алерт, чем пропуск)
+// - Массовое производство: threshold=0.8 (меньше ложных остановок)
+// Конфиг через env позволяет менять порог без пересборки.
+type InferenceConfig struct {
+	// ModelPath — путь к .onnx файлу модели.
+	// Если файл не найден — сервер работает без ML (graceful degradation).
+	ModelPath string
+	// SharedLibPath — путь к onnxruntime.dll (Windows) / libonnxruntime.so (Linux).
+	// Скачивается с github.com/microsoft/onnxruntime/releases.
+	SharedLibPath string
+	// WindowSize — размер скользящего окна (количество замеров).
+	// Должен совпадать с window_size при обучении модели.
+	WindowSize int
+	// Threshold — порог anomaly score для классификации как аномалия (0..1).
+	Threshold float64
+}
+
 // Load читает конфигурацию из переменных окружения с дефолтными значениями.
 //
 // ПОЧЕМУ не используем библиотеку (viper, envconfig)?
@@ -127,6 +149,12 @@ func Load() *Config {
 			GRPCPort: getEnvInt("GRPC_PORT", 50051),
 			HTTPPort: getEnvInt("HTTP_PORT", 8080),
 		},
+		Inference: InferenceConfig{
+			ModelPath:     getEnv("INFERENCE_MODEL_PATH", "./models/anomaly_detector.onnx"),
+			SharedLibPath: getEnv("INFERENCE_SHARED_LIB", "./onnxruntime.dll"),
+			WindowSize:    getEnvInt("INFERENCE_WINDOW_SIZE", 10),
+			Threshold:     getEnvFloat("INFERENCE_THRESHOLD", 0.7),
+		},
 	}
 }
 
@@ -156,6 +184,18 @@ func getEnvInt(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return n
+}
+
+func getEnvFloat(key string, defaultVal float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
 }
 
 func getEnvDuration(key string, defaultVal time.Duration) time.Duration {

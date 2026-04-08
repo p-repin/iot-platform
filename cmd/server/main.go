@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/pzmash/iot-platform/internal/config"
+	"github.com/pzmash/iot-platform/internal/inference"
 	"github.com/pzmash/iot-platform/internal/repository"
 	"github.com/pzmash/iot-platform/internal/service"
 	grpcTransport "github.com/pzmash/iot-platform/internal/transport/grpc"
@@ -75,13 +76,49 @@ func main() {
 	}
 	defer repo.Close()
 
-	// === 4. Собираем зависимости (Composition Root) ===
-	// Цепочка: PostgresRepo → DBService → gRPC Server
+	// === 4. ML-инференс ===
+	// Создаём предиктор аномалий.
+	// С CGO — реальный ONNX Runtime (Isolation Forest).
+	// Без CGO — StubPredictor (Z-score, работает везде).
+	// ПОЧЕМУ два режима?
+	// - ONNX Runtime требует CGO + GCC + shared library (~30 МБ)
+	// - StubPredictor работает из коробки — для dev и CI
+	// - Интерфейс Predictor одинаковый — код сервиса не меняется
+	slog.Info("Инициализация ML-инференса...",
+		"model", cfg.Inference.ModelPath,
+		"window_size", cfg.Inference.WindowSize,
+		"threshold", cfg.Inference.Threshold,
+	)
+
+	var inferSvc *inference.Service
+	predictor, err := inference.NewPredictor(
+		cfg.Inference.SharedLibPath,
+		cfg.Inference.ModelPath,
+		cfg.Inference.WindowSize*3, // 3 параметра: temperature, vibration, pressure
+	)
+	if err != nil {
+		slog.Warn("ML-инференс недоступен, сервер работает без ML",
+			"error", err,
+		)
+	} else {
+		inferSvc = inference.NewService(predictor, cfg.Inference.WindowSize, cfg.Inference.Threshold, logger)
+		defer inferSvc.Close()
+		slog.Info("ML-инференс активирован",
+			"window_size", cfg.Inference.WindowSize,
+			"threshold", cfg.Inference.Threshold,
+		)
+	}
+
+	// === 5. Event Repository (для записи результатов инференса) ===
+	eventRepo := repository.NewPostgresEventRepo(repo.Pool(), logger)
+
+	// === 6. Собираем зависимости (Composition Root) ===
+	// Цепочка: PostgresRepo → DBService (+ inference + events) → gRPC Server
 	// Каждый слой получает зависимости через конструктор (DI без фреймворков).
-	svc := service.NewDBService(repo)
+	svc := service.NewDBService(repo, inferSvc, eventRepo)
 	telemetryServer := grpcTransport.NewServer(svc)
 
-	// === 5. gRPC сервер ===
+	// === 7. gRPC сервер ===
 	grpcServer := grpc.NewServer()
 	pb.RegisterTelemetryServiceServer(grpcServer, telemetryServer)
 
@@ -98,7 +135,7 @@ func main() {
 
 	slog.Info("gRPC сервер запущен", "addr", addr)
 
-	// === 6. Запуск с graceful shutdown ===
+	// === 8. Запуск с graceful shutdown ===
 	// Запускаем gRPC сервер в отдельной горутине, чтобы main мог
 	// ждать сигнал завершения в select.
 	//

@@ -164,6 +164,16 @@ func (r *PostgresRepo) InsertBatch(ctx context.Context, records []entity.Record)
 	return nil
 }
 
+// Pool возвращает пул соединений для переиспользования другими репозиториями.
+//
+// ЗАЧЕМ?
+// EventRepository использует тот же пул, что и TelemetryRepository.
+// Создавать отдельный пул — лишний расход ресурсов.
+// Composition Root (main.go) передаёт пул из PostgresRepo в PostgresEventRepo.
+func (r *PostgresRepo) Pool() *pgxpool.Pool {
+	return r.pool
+}
+
 // Close закрывает пул соединений к PostgreSQL.
 // Вызывается при graceful shutdown сервера.
 // После Close все попытки выполнить запрос вернут ошибку.

@@ -19,7 +19,9 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/google/uuid"
 	"github.com/pzmash/iot-platform/internal/entity"
+	"github.com/pzmash/iot-platform/internal/inference"
 	"github.com/pzmash/iot-platform/internal/repository"
 )
 
@@ -47,19 +49,34 @@ type TelemetryService interface {
 // 2. Заменить PostgreSQL на другую БД без изменения сервиса
 // 3. Добавить кэширование (декоратор поверх репозитория) прозрачно
 type DBService struct {
-	repo repository.TelemetryRepository
+	repo      repository.TelemetryRepository
+	// inference — ML-сервис для обнаружения аномалий (опционален).
+	// Если nil — сервер работает без ML (graceful degradation).
+	// ПОЧЕМУ опционален?
+	// - Для dev-окружения без ONNX Runtime
+	// - Для запуска без обученной модели (первый деплой)
+	// - ML — дополнение к pipeline, а не обязательный шаг
+	inference *inference.Service
+	// eventRepo — репозиторий для записи событий инференса.
+	// Аномалии записываются как InferenceCompleted в Event Sourcing журнал.
+	eventRepo repository.EventRepository
 }
 
 // NewDBService создаёт сервис с указанным репозиторием.
 //
 // COMPOSITION ROOT (cmd/server/main.go) создаёт зависимости:
 //   repo := repository.NewPostgresRepo(ctx, dsn)
-//   svc  := service.NewDBService(repo)
+//   svc  := service.NewDBService(repo, inferSvc, eventRepo)
 //   srv  := grpc.NewServer(svc)
 //
 // Каждый слой получает свои зависимости через конструктор — это DI (Dependency Injection).
-func NewDBService(repo repository.TelemetryRepository) *DBService {
-	return &DBService{repo: repo}
+// inference и eventRepo могут быть nil — сервер работает без ML.
+func NewDBService(repo repository.TelemetryRepository, inferSvc *inference.Service, eventRepo repository.EventRepository) *DBService {
+	return &DBService{
+		repo:      repo,
+		inference: inferSvc,
+		eventRepo: eventRepo,
+	}
 }
 
 // HandleBatch записывает батч телеметрии в БД.
@@ -92,6 +109,39 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 		"agent_id", batch.AgentID,
 		"records", len(batch.Records),
 	)
+
+	// === ML-инференс (Фаза 4) ===
+	// Вызываем ПОСЛЕ успешной записи в БД.
+	// ПОЧЕМУ после, а не до?
+	// 1. Данные уже сохранены — даже если ML упадёт, телеметрия не потеряна
+	// 2. ML — дополнение, а не критический путь (best-effort)
+	// 3. При ошибке инференса мы логируем, но не возвращаем ошибку агенту
+	if s.inference != nil {
+		results := s.inference.Analyze(ctx, batch.Records)
+
+		// Записываем аномалии в Event Sourcing журнал
+		for _, r := range results {
+			if r.IsAnomaly && s.eventRepo != nil {
+				event := repository.Event{
+					EventType:   "InferenceCompleted",
+					AggregateID: uuid.New().String(),
+					Payload: map[string]any{
+						"machine_id": r.MachineID,
+						"score":      r.Score,
+						"is_anomaly": r.IsAnomaly,
+						"model":      "anomaly_detector_v1",
+					},
+					CreatedAt: r.Timestamp,
+				}
+				if err := s.eventRepo.InsertEvent(ctx, event); err != nil {
+					slog.Error("Ошибка записи события инференса",
+						"machine_id", r.MachineID,
+						"error", err,
+					)
+				}
+			}
+		}
+	}
 
 	return len(batch.Records), nil, nil
 }
