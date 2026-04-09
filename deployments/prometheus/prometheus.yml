@@ -1,0 +1,45 @@
+# prometheus.yml — конфигурация Prometheus для сбора метрик.
+#
+# Prometheus работает по PULL-модели:
+# каждые scrape_interval он ходит на /metrics endpoint и забирает метрики.
+#
+# ПОЧЕМУ pull, а не push (как StatsD)?
+# 1. Prometheus сам решает когда и как часто собирать — контроль нагрузки
+# 2. Сервис не знает о Prometheus — меньше связанность
+# 3. Если сервис упал — Prometheus это увидит (отсутствие метрик = алерт)
+# 4. С push: сервис может завалить мониторинг потоком данных
+#
+# На собеседовании: "Почему Prometheus, а не Graphite/InfluxDB?"
+# - Kubernetes-native: service discovery, labels, PromQL
+# - Стандарт де-факто в Cloud Native (CNCF graduated project)
+# - Alertmanager для алертинга "из коробки"
+
+global:
+  # Интервал сбора метрик.
+  # 15с — стандарт. Для high-frequency мониторинга можно 5с,
+  # но это увеличит нагрузку на Prometheus и объём данных.
+  scrape_interval: 15s
+  # Таймаут на один scrape. Если сервис не ответил за 10с — считаем его недоступным.
+  scrape_timeout: 10s
+
+# Источники метрик (scrape targets).
+# Каждый job = одна группа сервисов с одинаковой ролью.
+scrape_configs:
+  # Метрики Go-сервера (наше приложение)
+  - job_name: 'pzmash-server'
+    # static_configs — фиксированные адреса (для dev).
+    # В Kubernetes используется kubernetes_sd_configs — автообнаружение подов.
+    # В Docker Compose — тоже static, потому что адреса фиксированы.
+    static_configs:
+      # host.docker.internal — адрес хоста из контейнера Docker.
+      # ПОЧЕМУ не localhost?
+      # Prometheus запущен В КОНТЕЙНЕРЕ. localhost внутри контейнера — это сам контейнер.
+      # host.docker.internal указывает на хостовую машину, где работает Go-сервер.
+      #
+      # В проде (Kubernetes) здесь будет DNS-имя сервиса: pzmash-server.default.svc.cluster.local
+      - targets: ['host.docker.internal:8080']
+
+  # Метрики самого Prometheus (self-monitoring)
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

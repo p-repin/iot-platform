@@ -1,0 +1,57 @@
+# loki-config.yml — конфигурация Loki для хранения логов.
+#
+# ПОЧЕМУ Loki, а не Elasticsearch?
+# 1. Ресурсы: Loki потребляет ~10x меньше RAM (не индексирует содержимое логов)
+# 2. Простота: один бинарник vs кластер Elasticsearch + Kibana
+# 3. Интеграция: нативная поддержка в Grafana (тот же UI для метрик и логов)
+# 4. Для 20 станков Elasticsearch = пушка по воробьям
+#
+# ОГРАНИЧЕНИЕ Loki: поиск по содержимому медленнее чем в Elasticsearch.
+# Loki индексирует только LABELS (job, container), а не текст логов.
+# Для полнотекстового поиска по миллионам строк Elasticsearch лучше.
+# Для наших объёмов Loki более чем достаточен.
+#
+# На собеседовании: "Как организован сбор логов?"
+# Ответ: PLG-стек (Promtail + Loki + Grafana). Promtail собирает JSON-логи
+# из stdout контейнеров, отправляет в Loki. В Grafana можно искать по labels
+# и фильтровать по содержимому. Лёгкая альтернатива ELK/EFK.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Retention — сколько хранить логи.
+# 72h (3 дня) для dev. В проде обычно 7-30 дней.
+# ПОЧЕМУ не бесконечно? Логи съедают диск. Ротация обязательна.
+limits_config:
+  retention_period: 72h
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  # delete_request_store — обязательно при retention_enabled=true (с Loki 3.x).
+  # Указывает куда сохранять запросы на удаление старых данных.
+  # filesystem — простейший вариант для single-node.
+  delete_request_store: filesystem

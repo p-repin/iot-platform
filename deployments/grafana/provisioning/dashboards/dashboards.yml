@@ -1,0 +1,17 @@
+# dashboards.yml — автоматический импорт дашбордов в Grafana.
+#
+# Grafana при старте загрузит JSON-файлы дашбордов из указанной директории.
+# Это infrastructure-as-code: дашборд хранится в git, а не "в голове DevOps-а".
+
+apiVersion: 1
+
+providers:
+  - name: 'PZMASH'
+    # Папка в UI Grafana, куда попадут дашборды
+    folder: 'PZMASH IoT'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      # Путь внутри контейнера (монтируется через docker-compose volume)
+      path: /var/lib/grafana/dashboards

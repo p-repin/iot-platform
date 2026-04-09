@@ -18,11 +18,14 @@ package service
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/pzmash/iot-platform/internal/alerting"
 	"github.com/pzmash/iot-platform/internal/entity"
 	"github.com/pzmash/iot-platform/internal/events"
 	"github.com/pzmash/iot-platform/internal/inference"
+	"github.com/pzmash/iot-platform/internal/metrics"
 	"github.com/pzmash/iot-platform/internal/repository"
 )
 
@@ -60,26 +63,36 @@ type DBService struct {
 	inference *inference.Service
 	// eventStore — хранилище событий Event Sourcing (Фаза 5).
 	// Аномалии записываются как InferenceCompleted в append-only журнал.
-	// ПОЧЕМУ events.EventStore, а не repository.EventRepository?
-	// EventStore — новый интерфейс из пакета events, поддерживающий
-	// и запись (Append), и чтение (LoadEvents) для восстановления состояния.
 	eventStore events.EventStore
+	// alertEngine — движок проверки правил алертинга (Фаза 6).
+	// Проверяет каждую запись: temperature > 100 → warning и т.д.
+	alertEngine *alerting.Engine
+	// alertNotifier — отправка алертов в Redis pub/sub + сохранение critical в БД.
+	alertNotifier *alerting.Notifier
 }
 
 // NewDBService создаёт сервис с указанным репозиторием.
 //
 // COMPOSITION ROOT (cmd/server/main.go) создаёт зависимости:
 //   repo := repository.NewPostgresRepo(ctx, dsn)
-//   svc  := service.NewDBService(repo, inferSvc, eventStore)
+//   svc  := service.NewDBService(repo, inferSvc, eventStore, engine, notifier)
 //   srv  := grpc.NewServer(svc)
 //
 // Каждый слой получает свои зависимости через конструктор — это DI (Dependency Injection).
-// inference и eventStore могут быть nil — сервер работает без ML.
-func NewDBService(repo repository.TelemetryRepository, inferSvc *inference.Service, eventStore events.EventStore) *DBService {
+// inference, eventStore, alertEngine, alertNotifier могут быть nil — graceful degradation.
+func NewDBService(
+	repo repository.TelemetryRepository,
+	inferSvc *inference.Service,
+	eventStore events.EventStore,
+	alertEngine *alerting.Engine,
+	alertNotifier *alerting.Notifier,
+) *DBService {
 	return &DBService{
-		repo:       repo,
-		inference:  inferSvc,
-		eventStore: eventStore,
+		repo:          repo,
+		inference:     inferSvc,
+		eventStore:    eventStore,
+		alertEngine:   alertEngine,
+		alertNotifier: alertNotifier,
 	}
 }
 
@@ -95,6 +108,14 @@ func NewDBService(repo repository.TelemetryRepository, inferSvc *inference.Servi
 // - Фаза 4: вызов ML-инференса после записи
 // - Фаза 6: проверка алертинг-правил (temperature > 100 → warning)
 func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, []entity.RecordError, error) {
+	// === Prometheus метрики (Фаза 6) ===
+	// Замеряем общее время обработки батча (БД + инференс + алертинг).
+	// time.Since в defer гарантирует замер даже при ошибке.
+	start := time.Now()
+	defer func() {
+		metrics.BatchDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	slog.Debug("Обработка батча",
 		"agent_id", batch.AgentID,
 		"records", len(batch.Records),
@@ -106,8 +127,13 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 			"records", len(batch.Records),
 			"error", err,
 		)
+		metrics.ErrorsTotal.WithLabelValues("db_write").Inc()
 		return 0, nil, err
 	}
+
+	// Обновляем счётчики Prometheus
+	metrics.RecordsTotal.Add(float64(len(batch.Records)))
+	metrics.BatchesTotal.Inc()
 
 	slog.Info("Батч записан в БД",
 		"agent_id", batch.AgentID,
@@ -121,13 +147,11 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 	// 2. ML — дополнение, а не критический путь (best-effort)
 	// 3. При ошибке инференса мы логируем, но не возвращаем ошибку агенту
 	if s.inference != nil {
+		inferStart := time.Now()
 		results := s.inference.Analyze(ctx, batch.Records)
+		metrics.InferenceDuration.Observe(time.Since(inferStart).Seconds())
 
 		// Записываем аномалии в Event Sourcing журнал через EventStore.
-		// ПОЧЕМУ events.DomainEvent вместо repository.Event?
-		// DomainEvent — типизированный: payload = *InferenceCompletedPayload,
-		// а не map[string]any. Это позволяет десериализовать payload
-		// при LoadEvents и использовать в Rebuild агрегата.
 		for _, r := range results {
 			if r.IsAnomaly && s.eventStore != nil {
 				event := events.DomainEvent{
@@ -146,8 +170,39 @@ func (s *DBService) HandleBatch(ctx context.Context, batch entity.Batch) (int, [
 						"machine_id", r.MachineID,
 						"error", err,
 					)
+					metrics.ErrorsTotal.WithLabelValues("event_store").Inc()
 				}
 			}
+		}
+	}
+
+	// === Публикация телеметрии на дашборд (Фаза 6) ===
+	// Отправляем показания станков через Redis pub/sub → WebSocket → браузер.
+	// Оператор видит текущие значения температуры, вибрации, давления.
+	if s.alertNotifier != nil {
+		s.alertNotifier.PublishTelemetry(ctx, batch.Records)
+	}
+
+	// === Алертинг (Фаза 6) ===
+	// Проверяем каждую запись батча по правилам алертинга.
+	// ПОЧЕМУ после записи в БД и инференса?
+	// 1. Данные уже сохранены — алертинг не блокирует основной pipeline
+	// 2. Алерты — best-effort: если Redis недоступен, данные не теряются
+	// 3. В будущем можно комбинировать: ML-аномалия + превышение порога = higher severity
+	if s.alertEngine != nil && s.alertNotifier != nil {
+		alerts := s.alertEngine.EvaluateBatch(batch.Records)
+		if len(alerts) > 0 {
+			s.alertNotifier.Notify(ctx, alerts)
+
+			// Обновляем Prometheus-счётчик алертов по severity
+			for _, a := range alerts {
+				metrics.AlertsTotal.WithLabelValues(string(a.Severity)).Inc()
+			}
+
+			slog.Info("Алерты обработаны",
+				"count", len(alerts),
+				"agent_id", batch.AgentID,
+			)
 		}
 	}
 

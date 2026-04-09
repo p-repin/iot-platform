@@ -1,0 +1,61 @@
+# promtail-config.yml — конфигурация Promtail для сбора логов.
+#
+# Promtail — агент сбора логов (аналог Filebeat в ELK-стеке).
+# Читает логи из Docker-контейнеров и отправляет в Loki.
+#
+# ПОЧЕМУ Promtail, а не Fluentd/Fluent Bit?
+# 1. Нативная интеграция с Loki (тот же разработчик — Grafana Labs)
+# 2. Минимальный footprint: ~15 МБ RAM vs ~50 МБ для Fluent Bit
+# 3. Автоматический service discovery для Docker-контейнеров
+# 4. Для PLG-стека Promtail — оптимальный выбор
+#
+# АРХИТЕКТУРА сбора логов:
+# Go-сервер → stdout (JSON) → Docker logging driver → /var/lib/docker/containers/
+# → Promtail читает файлы → отправляет в Loki → Grafana отображает
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  # positions.yml — файл с позициями чтения (offset в каждом log-файле).
+  # ПОЧЕМУ нужен? Если Promtail перезапустится — он продолжит с того же места,
+  # а не перечитает все логи с начала (дедупликация).
+  filename: /tmp/positions.yaml
+
+clients:
+  # Куда отправлять логи. Loki доступен по имени сервиса в Docker network.
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # Сбор логов из Docker-контейнеров
+  - job_name: docker
+    # docker_sd_configs — автоматическое обнаружение контейнеров.
+    # Promtail сам находит все запущенные контейнеры и читает их логи.
+    # АЛЬТЕРНАТИВА: можно указать пути вручную (static_configs),
+    # но docker_sd_configs удобнее — новые контейнеры подхватываются автоматически.
+    docker_sd_configs:
+      - host: "unix:///var/run/docker.sock"
+        refresh_interval: 5s
+
+    relabel_configs:
+      # Добавляем label "container" с именем контейнера.
+      # В Grafana можно фильтровать: {container="pzmash-timescaledb"}
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+
+      # Добавляем label "image" с именем Docker-образа.
+      - source_labels: ['__meta_docker_container_image']
+        target_label: 'image'
+
+    pipeline_stages:
+      # Парсим JSON-логи от Go-сервера (slog.NewJSONHandler).
+      # Формат: {"time":"...","level":"INFO","msg":"...","key":"value"}
+      # После парсинга можно искать по полям: |= "error" или | json | level="ERROR"
+      - json:
+          expressions:
+            level: level
+            msg: msg
+      - labels:
+          level:

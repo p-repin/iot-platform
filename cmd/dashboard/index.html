@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PZMASH — Дашборд оператора</title>
+    <!--
+    ДАШБОРД ОПЕРАТОРА — два блока:
+    1. Таблица станков: текущие показания (температура, вибрация, давление)
+    2. Лента алертов: сработавшие правила в реальном времени
+
+    Оператор видит ВСЮ картину:
+    - Нормальные показания — зелёный, всё ОК
+    - Приближение к порогу — жёлтый, наблюдать
+    - Превышение — красный + алерт в ленте
+
+    АРХИТЕКТУРА:
+    - WebSocket подключается к серверу (ws://host:8080/ws)
+    - Сервер пробрасывает ДВА потока из Redis pub/sub:
+      1. "telemetry" — показания станков каждую секунду
+      2. "alerts" — сработавшие правила алертинга
+    - JavaScript различает по полю type: "telemetry" vs alert (нет type)
+    -->
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: #16213e;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 2px solid #0f3460;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            color: #e94560;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e94560;
+        }
+
+        .status-dot.connected {
+            background: #4caf50;
+        }
+
+        /* === Основная сетка: станки слева, алерты справа === */
+        .main {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            padding: 16px;
+            height: calc(100vh - 60px);
+        }
+
+        /* === Панель станков (левая) === */
+        .machines-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            overflow-y: auto;
+        }
+
+        .machines-panel h2 {
+            font-size: 16px;
+            color: #a0a0a0;
+        }
+
+        /* Таблица показаний станков */
+        .machines-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+
+        .machines-table th {
+            text-align: left;
+            padding: 10px 12px;
+            background: #16213e;
+            color: #718096;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 2px solid #0f3460;
+        }
+
+        .machines-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #2a2a4a;
+            transition: background 0.3s;
+        }
+
+        .machines-table tr:hover td {
+            background: #1e2a4a;
+        }
+
+        .machines-table .machine-name {
+            font-weight: bold;
+            color: #e0e0e0;
+        }
+
+        /* Цветовая индикация значений.
+           Пороги соответствуют правилам алертинга из rules.go:
+           - normal (зелёный): ниже info-порога
+           - elevated (жёлтый): между info и warning
+           - danger (красный): выше warning */
+        .val-normal { color: #4caf50; }
+        .val-elevated { color: #ecc94b; }
+        .val-danger { color: #fc8181; font-weight: bold; }
+
+        .machine-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .machine-status.ok { background: #4caf50; }
+        .machine-status.warn { background: #ecc94b; }
+        .machine-status.crit { background: #e94560; animation: pulse 1s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .last-update {
+            font-size: 11px;
+            color: #4a5568;
+        }
+
+        /* === Панель алертов (правая) === */
+        .alerts-section {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            overflow: hidden;
+        }
+
+        .alerts-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .alerts-header h2 {
+            font-size: 16px;
+            color: #a0a0a0;
+        }
+
+        .alert-counts {
+            display: flex;
+            gap: 12px;
+            font-size: 13px;
+        }
+
+        .alert-counts .count-critical { color: #fc8181; }
+        .alert-counts .count-warning { color: #ecc94b; }
+        .alert-counts .count-info { color: #63b3ed; }
+
+        .alerts-list {
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .alert-card {
+            padding: 10px 14px;
+            margin-bottom: 6px;
+            border-radius: 6px;
+            border-left: 4px solid;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .alert-card.info {
+            background: #1a365d;
+            border-color: #3182ce;
+        }
+
+        .alert-card.warning {
+            background: #744210;
+            border-color: #ecc94b;
+        }
+
+        .alert-card.critical {
+            background: #742a2a;
+            border-color: #e94560;
+        }
+
+        .alert-card .severity-badge {
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 3px;
+        }
+
+        .alert-card.info .severity-badge { color: #63b3ed; }
+        .alert-card.warning .severity-badge { color: #ecc94b; }
+        .alert-card.critical .severity-badge { color: #fc8181; }
+
+        .alert-card .message {
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .alert-card .meta {
+            font-size: 11px;
+            color: #718096;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #4a5568;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>PZMASH IoT — Дашборд оператора</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Отключён</span>
+        </div>
+    </div>
+
+    <div class="main">
+        <!-- Левая панель: текущие показания станков -->
+        <div class="machines-panel">
+            <h2>Показания станков</h2>
+            <table class="machines-table">
+                <thead>
+                    <tr>
+                        <th>Станок</th>
+                        <th>Температура</th>
+                        <th>Вибрация</th>
+                        <th>Давление</th>
+                        <th>Обновлено</th>
+                    </tr>
+                </thead>
+                <tbody id="machinesBody">
+                    <!-- Строки добавляются динамически при получении телеметрии -->
+                </tbody>
+            </table>
+            <div class="empty-state" id="machinesEmpty">
+                Ожидание данных со станков...
+            </div>
+        </div>
+
+        <!-- Правая панель: лента алертов -->
+        <div class="alerts-section">
+            <div class="alerts-header">
+                <h2>Алерты</h2>
+                <div class="alert-counts">
+                    <span class="count-critical" id="criticalCount">0 crit</span>
+                    <span class="count-warning" id="warningCount">0 warn</span>
+                    <span class="count-info" id="infoCount">0 info</span>
+                </div>
+            </div>
+            <div class="alerts-list" id="alerts">
+                <div class="empty-state" id="alertsEmpty">
+                    Нет алертов
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // ================================================================
+    // WebSocket подключение + обработка двух типов сообщений
+    // ================================================================
+
+    const MAX_ALERTS = 200;
+    let reconnectDelay = 1000;
+    let ws = null;
+
+    // Счётчики алертов
+    const counts = { critical: 0, warning: 0, info: 0 };
+
+    // Состояние станков: machine_id → {temperature, vibration, pressure, timestamp}
+    // Хранит ПОСЛЕДНИЕ показания каждого станка для отображения в таблице.
+    const machines = {};
+
+    // Пороги для цветовой индикации (совпадают с rules.go)
+    const thresholds = {
+        temperature: { info: 90, warning: 100, critical: 120 },
+        vibration:   { info: 8,  warning: 12,  critical: 15 },
+        pressure:    { info: 9,  warning: 10,  critical: 12 }
+    };
+
+    function connect() {
+        const wsHost = window.location.hostname || 'localhost';
+        const wsUrl = 'ws://' + wsHost + ':8080/ws';
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = function() {
+            reconnectDelay = 1000;
+            document.getElementById('statusDot').classList.add('connected');
+            document.getElementById('statusText').textContent = 'Подключён';
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                const msg = JSON.parse(event.data);
+                // Различаем типы сообщений по полю "type".
+                // Телеметрия: {type: "telemetry", machine_id, temperature, ...}
+                // Алерт: {machine_id, severity, message, ...} (без type)
+                if (msg.type === 'telemetry') {
+                    updateMachine(msg);
+                } else {
+                    addAlert(msg);
+                }
+            } catch (e) {
+                console.error('Ошибка парсинга:', e);
+            }
+        };
+
+        ws.onclose = function() {
+            document.getElementById('statusDot').classList.remove('connected');
+            document.getElementById('statusText').textContent =
+                'Переподключение через ' + (reconnectDelay / 1000) + 'с...';
+            setTimeout(connect, reconnectDelay);
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        };
+
+        ws.onerror = function(err) {
+            console.error('WebSocket ошибка:', err);
+        };
+    }
+
+    // === Обновление таблицы станков ===
+
+    function updateMachine(msg) {
+        // Убираем пустое состояние
+        const empty = document.getElementById('machinesEmpty');
+        if (empty) empty.style.display = 'none';
+
+        // Сохраняем последние показания
+        machines[msg.machine_id] = {
+            temperature: msg.temperature,
+            vibration: msg.vibration,
+            pressure: msg.pressure,
+            timestamp: msg.timestamp
+        };
+
+        renderMachineRow(msg.machine_id);
+    }
+
+    // renderMachineRow — создаёт или обновляет строку станка в таблице.
+    function renderMachineRow(machineId) {
+        const data = machines[machineId];
+        const tbody = document.getElementById('machinesBody');
+
+        let row = document.getElementById('machine-' + machineId);
+        if (!row) {
+            row = document.createElement('tr');
+            row.id = 'machine-' + machineId;
+            // Вставляем в алфавитном порядке
+            const rows = Array.from(tbody.children);
+            const insertBefore = rows.find(r => r.id > 'machine-' + machineId);
+            tbody.insertBefore(row, insertBefore || null);
+        }
+
+        // Определяем общий статус станка (наихудший из трёх параметров)
+        const status = worstStatus(data);
+        const statusClass = status === 'critical' ? 'crit' : status === 'warning' ? 'warn' : 'ok';
+
+        const time = data.timestamp
+            ? new Date(data.timestamp).toLocaleTimeString('ru-RU')
+            : '—';
+
+        row.innerHTML =
+            '<td class="machine-name">' +
+                '<span class="machine-status ' + statusClass + '"></span>' +
+                escapeHtml(machineId) +
+            '</td>' +
+            '<td class="' + valueClass(data.temperature, thresholds.temperature) + '">' +
+                data.temperature.toFixed(1) + ' °C</td>' +
+            '<td class="' + valueClass(data.vibration, thresholds.vibration) + '">' +
+                data.vibration.toFixed(2) + ' мм/с</td>' +
+            '<td class="' + valueClass(data.pressure, thresholds.pressure) + '">' +
+                data.pressure.toFixed(2) + ' бар</td>' +
+            '<td class="last-update">' + time + '</td>';
+    }
+
+    // valueClass — CSS-класс для цвета значения в зависимости от порогов.
+    function valueClass(value, thresh) {
+        if (value > thresh.warning) return 'val-danger';
+        if (value > thresh.info) return 'val-elevated';
+        return 'val-normal';
+    }
+
+    // worstStatus — определяет наихудший статус станка из всех параметров.
+    function worstStatus(data) {
+        const checks = [
+            { value: data.temperature, thresh: thresholds.temperature },
+            { value: data.vibration, thresh: thresholds.vibration },
+            { value: data.pressure, thresh: thresholds.pressure }
+        ];
+
+        let worst = 'ok';
+        for (const c of checks) {
+            if (c.value > c.thresh.warning) return 'critical';
+            if (c.value > c.thresh.info && worst === 'ok') worst = 'warning';
+        }
+        return worst;
+    }
+
+    // === Лента алертов ===
+
+    function addAlert(alert) {
+        const empty = document.getElementById('alertsEmpty');
+        if (empty) empty.remove();
+
+        const severity = alert.severity || 'info';
+        if (counts[severity] !== undefined) {
+            counts[severity]++;
+        }
+        updateAlertCounts();
+
+        const card = document.createElement('div');
+        card.className = 'alert-card ' + severity;
+
+        const time = alert.created_at
+            ? new Date(alert.created_at).toLocaleTimeString('ru-RU')
+            : new Date().toLocaleTimeString('ru-RU');
+
+        card.innerHTML =
+            '<div class="severity-badge">' + severity.toUpperCase() + '</div>' +
+            '<div class="message">' + escapeHtml(alert.message || 'Алерт') + '</div>' +
+            '<div class="meta">' +
+                '<span>' + escapeHtml(alert.machine_id || '—') + '</span>' +
+                '<span>' + time + '</span>' +
+            '</div>';
+
+        const container = document.getElementById('alerts');
+        container.insertBefore(card, container.firstChild);
+
+        while (container.children.length > MAX_ALERTS) {
+            container.removeChild(container.lastChild);
+        }
+    }
+
+    function updateAlertCounts() {
+        document.getElementById('criticalCount').textContent = counts.critical + ' crit';
+        document.getElementById('warningCount').textContent = counts.warning + ' warn';
+        document.getElementById('infoCount').textContent = counts.info + ' info';
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Стартуем подключение
+    connect();
+    </script>
+</body>
+</html>

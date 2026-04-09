@@ -1,0 +1,28 @@
+# datasources.yml — автоматическая настройка источников данных Grafana.
+#
+# PROVISIONING — Grafana автоматически создаёт datasources при первом запуске.
+# Без этого файла нужно было бы настраивать руками через UI.
+# Infrastructure-as-Code: конфиг в git, воспроизводимость, нет ручных действий.
+#
+# На собеседовании: "Как вы настраиваете Grafana?"
+# Ответ: provisioning через YAML — datasources и dashboards подключаются
+# автоматически при старте контейнера. Конфиги хранятся в git.
+
+apiVersion: 1
+
+datasources:
+  # Prometheus — основной источник метрик
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # URL внутри Docker network. Контейнеры общаются по имени сервиса.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+  # Loki — источник логов
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true

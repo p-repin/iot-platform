@@ -3,6 +3,9 @@
 // COMPOSITION ROOT — единственное место, где собираются все зависимости.
 // Здесь мы "склеиваем" слои чистой архитектуры:
 //   pgxpool → PostgresRepo → DBService → gRPC Server
+//   Redis → Notifier → DBService (алертинг)
+//   Redis → WebSocket Handler (real-time дашборд)
+//   HTTP: /metrics (Prometheus), /ws (WebSocket), / (дашборд)
 //
 // ПОЧЕМУ зависимости собираются в main, а не в каждом пакете?
 // 1. Каждый пакет зависит от ИНТЕРФЕЙСОВ, а не от конкретных реализаций
@@ -17,13 +20,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/pzmash/iot-platform/internal/alerting"
 	"github.com/pzmash/iot-platform/internal/config"
 	"github.com/pzmash/iot-platform/internal/events"
 	"github.com/pzmash/iot-platform/internal/inference"
@@ -31,24 +38,11 @@ import (
 	"github.com/pzmash/iot-platform/internal/service"
 	grpcTransport "github.com/pzmash/iot-platform/internal/transport/grpc"
 	pb "github.com/pzmash/iot-platform/internal/transport/grpc/pb"
+	"github.com/pzmash/iot-platform/internal/transport/ws"
 )
 
 func main() {
 	// === 1. Structured logging (slog) ===
-	// ПОЧЕМУ slog, а не zerolog/zap?
-	// slog — стандартная библиотека Go (с 1.21). Не нужна внешняя зависимость.
-	// zerolog/zap быстрее на ~20-30%, но для нашей нагрузки (20 станков) разницы нет.
-	// На собеседовании: "Мы используем slog из stdlib, при необходимости можно
-	// заменить handler на zerolog/zap без изменения вызывающего кода."
-	//
-	// ПОЧЕМУ JSON, а не Text?
-	// DevOps-требование: JSON-логи парсятся автоматически.
-	// Promtail/Loki/Elasticsearch читают JSON без кастомных regex-парсеров.
-	// TextHandler удобнее для локальной разработки, но в проде — только JSON.
-	//
-	// УРОВЕНЬ LevelDebug:
-	// В проде обычно LevelInfo (меньше шума). В dev — LevelDebug для отладки.
-	// Можно вынести в конфиг: LOG_LEVEL=debug|info|warn|error.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
@@ -58,16 +52,10 @@ func main() {
 	cfg := config.Load()
 
 	// === 2. Graceful shutdown ===
-	// signal.NotifyContext — создаёт контекст, отменяемый по SIGINT/SIGTERM.
-	// При docker stop контейнер получает SIGTERM → контекст отменяется →
-	// закрываем соединения и завершаемся корректно.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// === 3. Подключение к TimescaleDB ===
-	// ПОРЯДОК ИНИЦИАЛИЗАЦИИ: БД первая, потому что без неё сервер бесполезен.
-	// Если БД недоступна — падаем сразу (fail fast), а не через минуту
-	// когда придёт первый запрос от агента.
 	slog.Info("Подключение к TimescaleDB...", "host", cfg.DB.Host, "db", cfg.DB.DBName)
 
 	repo, err := repository.NewPostgresRepo(ctx, cfg.DB.DSN())
@@ -77,14 +65,50 @@ func main() {
 	}
 	defer repo.Close()
 
-	// === 4. ML-инференс ===
-	// Создаём предиктор аномалий.
-	// С CGO — реальный ONNX Runtime (Isolation Forest).
-	// Без CGO — StubPredictor (Z-score, работает везде).
-	// ПОЧЕМУ два режима?
-	// - ONNX Runtime требует CGO + GCC + shared library (~30 МБ)
-	// - StubPredictor работает из коробки — для dev и CI
-	// - Интерфейс Predictor одинаковый — код сервиса не меняется
+	// === 4. Redis (Фаза 6: алертинг + WebSocket) ===
+	// Redis используется для двух вещей:
+	// 1. Pub/Sub — мгновенная доставка алертов на дашборд
+	// 2. (В будущем) Кэширование — последние значения телеметрии для дашборда
+	//
+	// ПОЧЕМУ опционален?
+	// Сервер должен работать даже без Redis (graceful degradation).
+	// Просто алерты не будут приходить на дашборд в реальном времени.
+	slog.Info("Подключение к Redis...", "addr", cfg.Redis.Addr)
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+
+	// Проверяем подключение к Redis
+	var alertEngine *alerting.Engine
+	var alertNotifier *alerting.Notifier
+	var wsHandler *ws.Handler
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		slog.Warn("Redis недоступен, алертинг и WebSocket отключены",
+			"addr", cfg.Redis.Addr,
+			"error", err,
+		)
+	} else {
+		slog.Info("Redis подключён", "addr", cfg.Redis.Addr)
+
+		// Создаём движок алертинга с правилами по умолчанию
+		alertEngine = alerting.NewEngine(alerting.DefaultRules())
+
+		// Notifier: Redis pub/sub + сохранение critical в БД
+		alertNotifier = alerting.NewNotifier(rdb, repo.Pool(), logger)
+
+		// WebSocket handler: подписка на Redis → broadcast клиентам
+		wsHandler = ws.NewHandler(rdb, alertNotifier, logger)
+		go wsHandler.Run(ctx)
+
+		slog.Info("Алертинг и WebSocket активированы")
+	}
+	defer rdb.Close()
+
+	// === 5. ML-инференс ===
 	slog.Info("Инициализация ML-инференса...",
 		"model", cfg.Inference.ModelPath,
 		"window_size", cfg.Inference.WindowSize,
@@ -95,7 +119,7 @@ func main() {
 	predictor, err := inference.NewPredictor(
 		cfg.Inference.SharedLibPath,
 		cfg.Inference.ModelPath,
-		cfg.Inference.WindowSize*3, // 3 параметра: temperature, vibration, pressure
+		cfg.Inference.WindowSize*3,
 	)
 	if err != nil {
 		slog.Warn("ML-инференс недоступен, сервер работает без ML",
@@ -110,16 +134,10 @@ func main() {
 		)
 	}
 
-	// === 5. Event Store (Фаза 5: Event Sourcing) ===
-	// EventStore заменил EventRepository: поддерживает и запись (Append),
-	// и чтение (LoadEvents) для восстановления состояния агрегатов.
-	// Использует тот же pgxpool — отдельный пул не нужен.
+	// === 6. Event Store (Event Sourcing) ===
 	eventStore := events.NewPostgresEventStore(repo.Pool(), logger)
 
-	// === 5b. Симулятор жизненного цикла деталей ===
-	// Генерирует синтетические события: PartCreated → PartMachined → PartShipped.
-	// После каждого цикла восстанавливает состояние из БД (Rebuild) — доказывает
-	// что Event Sourcing работает. Выключается в проде: PART_SIMULATOR_ENABLED=false.
+	// Симулятор жизненного цикла деталей
 	if cfg.PartSimulator.Enabled {
 		simulator := events.NewPartSimulator(eventStore, cfg.PartSimulator.Interval, logger)
 		go simulator.Run(ctx)
@@ -128,58 +146,89 @@ func main() {
 		)
 	}
 
-	// === 6. Собираем зависимости (Composition Root) ===
-	// Цепочка: PostgresRepo → DBService (+ inference + eventStore) → gRPC Server
-	// Каждый слой получает зависимости через конструктор (DI без фреймворков).
-	svc := service.NewDBService(repo, inferSvc, eventStore)
+	// === 7. Собираем зависимости (Composition Root) ===
+	// Цепочка: PostgresRepo → DBService (+ inference + eventStore + alerting) → gRPC Server
+	svc := service.NewDBService(repo, inferSvc, eventStore, alertEngine, alertNotifier)
 	telemetryServer := grpcTransport.NewServer(svc)
 
-	// === 7. gRPC сервер ===
+	// === 8. gRPC сервер ===
 	grpcServer := grpc.NewServer()
 	pb.RegisterTelemetryServiceServer(grpcServer, telemetryServer)
-
-	// gRPC Reflection — инструменты (grpcurl, Postman) могут узнать
-	// список сервисов и методов БЕЗ .proto файла.
 	reflection.Register(grpcServer)
 
 	addr := fmt.Sprintf(":%d", cfg.Server.GRPCPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		slog.Error("Не удалось открыть порт", "addr", addr, "error", err)
+		slog.Error("Не удалось открыть gRPC порт", "addr", addr, "error", err)
 		os.Exit(1)
 	}
 
 	slog.Info("gRPC сервер запущен", "addr", addr)
 
-	// === 8. Запуск с graceful shutdown ===
-	// Запускаем gRPC сервер в отдельной горутине, чтобы main мог
-	// ждать сигнал завершения в select.
-	//
-	// ПОЧЕМУ горутина, а не просто Serve?
-	// grpcServer.Serve() блокирует. Если вызвать его в main —
-	// мы не сможем обработать SIGTERM (контекст отменится, но никто не вызовет
-	// GracefulStop). Горутина позволяет параллельно слушать ctx.Done().
-	errCh := make(chan error, 1)
+	// === 9. HTTP сервер (Фаза 6: метрики + WebSocket + дашборд) ===
+	// ПОЧЕМУ отдельный HTTP-сервер, а не добавлять к gRPC?
+	// 1. gRPC использует HTTP/2 с бинарным протоколом — нельзя смешивать
+	//    с обычными HTTP-эндпоинтами на одном порту (без grpc-gateway)
+	// 2. Prometheus ожидает стандартный HTTP GET /metrics
+	// 3. WebSocket требует HTTP/1.1 upgrade — несовместим с gRPC HTTP/2
+	// 4. Разные порты = можно открыть metrics только для внутренней сети
+	mux := http.NewServeMux()
+
+	// /metrics — Prometheus scraper будет ходить сюда каждые 15с.
+	// promhttp.Handler() экспортирует ВСЕ зарегистрированные метрики
+	// (наши + стандартные Go runtime: goroutines, memory, GC).
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// /ws — WebSocket endpoint для дашборда
+	if wsHandler != nil {
+		mux.Handle("/ws", wsHandler)
+	}
+
+	// / — дашборд оператора (статический HTML файл).
+	// Раздаём из директории cmd/dashboard/ относительно рабочей директории.
+	// ПОЧЕМУ http.FileServer, а не embed?
+	// embed.FS не поддерживает пути с ".." (нельзя ссылаться из cmd/server
+	// на cmd/dashboard). Для dev-окружения FileServer достаточен.
+	// В Фазе 8 (Docker) скопируем index.html в образ рядом с бинарником.
+	mux.Handle("/", http.FileServer(http.Dir("cmd/dashboard")))
+
+	httpAddr := fmt.Sprintf(":%d", cfg.Server.HTTPPort)
+	httpServer := &http.Server{
+		Addr:    httpAddr,
+		Handler: mux,
+	}
+
+	slog.Info("HTTP сервер запущен",
+		"addr", httpAddr,
+		"endpoints", []string{"/metrics", "/ws", "/"},
+	)
+
+	// === 10. Запуск с graceful shutdown ===
+	errCh := make(chan error, 2)
+
+	// gRPC сервер
 	go func() {
 		if err := grpcServer.Serve(listener); err != nil {
-			errCh <- err
+			errCh <- fmt.Errorf("gRPC: %w", err)
 		}
 	}()
 
-	// Ждём ЛИБО сигнал завершения, ЛИБО ошибку сервера.
+	// HTTP сервер
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("HTTP: %w", err)
+		}
+	}()
+
+	// Ждём ЛИБО сигнал завершения, ЛИБО ошибку сервера
 	select {
 	case <-ctx.Done():
-		// Получили SIGINT/SIGTERM → корректно завершаемся.
-		// GracefulStop:
-		// 1. Перестаёт принимать НОВЫЕ соединения
-		// 2. Ждёт завершения ТЕКУЩИХ запросов
-		// 3. Закрывает listener
-		// Это гарантирует что ни один запрос не оборвётся на середине.
-		slog.Info("Получен сигнал завершения, останавливаю gRPC сервер...")
+		slog.Info("Получен сигнал завершения, останавливаю серверы...")
 		grpcServer.GracefulStop()
-		slog.Info("Сервер остановлен корректно")
+		httpServer.Shutdown(context.Background())
+		slog.Info("Серверы остановлены корректно")
 	case err := <-errCh:
-		slog.Error("gRPC сервер упал", "error", err)
+		slog.Error("Сервер упал", "error", err)
 		os.Exit(1)
 	}
 }

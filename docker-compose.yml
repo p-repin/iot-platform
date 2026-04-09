@@ -102,6 +102,121 @@ services:
       timeout: 3s
       retries: 5
 
+  # ============================================================
+  # Prometheus — сбор и хранение метрик (Фаза 6)
+  # ============================================================
+  # ПОЧЕМУ Prometheus?
+  # - Стандарт мониторинга в Cloud Native / Kubernetes (CNCF graduated)
+  # - Pull-модель: Prometheus сам ходит на /metrics каждые 15с
+  # - Мощный язык запросов PromQL для аналитики и алертинга
+  # - Минимальная настройка: один конфиг-файл
+  #
+  # На собеседовании: "Как вы мониторите сервисы?"
+  # Ответ: Prometheus scrapes /metrics endpoint, Grafana визуализирует.
+  # RED-метрики: Rate (records/sec), Errors (errors_total), Duration (p95 latency).
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: pzmash-prometheus
+    ports:
+      # 9090 — UI Prometheus (PromQL, графики, статус targets)
+      - "9090:9090"
+    volumes:
+      # Конфиг Prometheus: какие targets скрейпить, с какой частотой
+      - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Данные метрик — персистентный том
+      - prometheus_data:/prometheus
+    # extra_hosts позволяет контейнеру обращаться к хосту по имени.
+    # ПОЧЕМУ? Go-сервер работает на хосте (go run), а не в контейнере.
+    # host.docker.internal → IP хоста. Без этого Prometheus не достучится до /metrics.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================================
+  # Grafana — визуализация метрик и логов (Фаза 6)
+  # ============================================================
+  # ПОЧЕМУ Grafana, а не Kibana / Datadog?
+  # - Open source, бесплатна для self-hosted
+  # - Поддерживает Prometheus + Loki + десятки других datasources
+  # - Provisioning: дашборды и datasources настраиваются через файлы
+  # - В air-gap контуре — работает полностью offline
+  #
+  # На собеседовании: "Как вы визуализируете метрики?"
+  # Ответ: Grafana с provisioned dashboards (JSON в git).
+  # Datasources: Prometheus для метрик, Loki для логов.
+  grafana:
+    image: grafana/grafana:11.6.1
+    container_name: pzmash-grafana
+    ports:
+      # 3000 — UI Grafana (дашборды, алерты, explore)
+      - "3000:3000"
+    environment:
+      # Отключаем обязательную авторизацию для dev-окружения.
+      # В проде: GF_SECURITY_ADMIN_PASSWORD через Docker secret.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      # Provisioning: автоматическая настройка datasources при старте
+      - ./deployments/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Provisioning: JSON-дашборды загружаются автоматически
+      - ./deployments/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Данные Grafana (настройки, пользователи, алерты)
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # ============================================================
+  # Loki — хранилище логов (Фаза 6, PLG-стек)
+  # ============================================================
+  # ПОЧЕМУ Loki, а не Elasticsearch?
+  # - Ресурсы: ~10x меньше RAM (не индексирует содержимое, только labels)
+  # - Простота: один бинарник vs кластер ES + настройка шардирования
+  # - Стоимость: для наших объёмов (20 станков) ES = перерасход
+  # - Интеграция: нативная поддержка в Grafana
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: pzmash-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deployments/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # Promtail — агент сбора логов (Фаза 6, PLG-стек)
+  # ============================================================
+  # Promtail читает stdout/stderr Docker-контейнеров и отправляет в Loki.
+  # Аналог Filebeat (ELK) или Fluent Bit (EFK).
+  #
+  # АРХИТЕКТУРА:
+  # Go-сервер → stdout (JSON) → Docker log driver → файлы на диске
+  # → Promtail читает → отправляет в Loki → Grafana отображает
+  promtail:
+    image: grafana/promtail:3.5.0
+    container_name: pzmash-promtail
+    volumes:
+      - ./deployments/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      # Docker socket — для обнаружения контейнеров (docker_sd_configs)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Логи контейнеров на хосте
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      loki:
+        condition: service_healthy
+
 # Именованные тома хранят данные между перезапусками контейнеров
 # ПОЧЕМУ именованные тома, а не bind mount (./data:/var/lib/...)?
 # - Производительность: на Windows bind mount значительно медленнее
@@ -109,3 +224,6 @@ services:
 # - Портируемость: работает одинаково на Linux/Mac/Windows
 volumes:
   timescaledb_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
